@@ -1,0 +1,80 @@
+// Grafana Alloy: collects the services' JSON logs and ships them to Loki.
+//
+// Two sources feed the same pipeline:
+//   1. Docker: containers labelled godigi.logs=true (the three services when
+//      started with docker compose).
+//   2. Files: tmp/logs/*.log, written by `make run` when the services run as
+//      local processes. Mounted into the container at /var/log/godigi.
+
+discovery.docker "services" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["godigi.logs=true"]
+  }
+}
+
+discovery.relabel "services" {
+  targets = []
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "services" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.services.targets
+  labels        = {"source" = "docker"}
+  relabel_rules = discovery.relabel.services.rules
+  forward_to    = [loki.process.godigi.receiver]
+}
+
+local.file_match "local_runs" {
+  path_targets = [{"__path__" = "/var/log/godigi/*.log", "source" = "local"}]
+}
+
+loki.source.file "local_runs" {
+  targets    = local.file_match.local_runs.targets
+  forward_to = [loki.process.godigi.receiver]
+}
+
+// Every service logs one JSON object per line (log/slog). Only the
+// low-cardinality fields become labels; everything else (status, route,
+// latency, bodies, request_id, ...) is extracted at query time with `| json`.
+loki.process "godigi" {
+  stage.json {
+    expressions = {
+      service = "service",
+      level   = "level",
+      time    = "time",
+    }
+  }
+
+  // Lines that are not our JSON (startup errors, panics) have no service
+  // field; label them so they are still findable.
+  stage.template {
+    source   = "service"
+    template = "{{ if .Value }}{{ .Value }}{{ else }}unknown{{ end }}"
+  }
+
+  stage.labels {
+    values = {
+      service = "",
+      level   = "",
+    }
+  }
+
+  stage.timestamp {
+    source = "time"
+    format = "RFC3339Nano"
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

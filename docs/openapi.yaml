@@ -1,0 +1,470 @@
+openapi: 3.0.3
+info:
+  title: Godigi User Management API
+  version: 1.0.0
+  description: |
+    Authentication and account management, served through the API gateway.
+
+    **Authentication.** Protected endpoints need `Authorization: Bearer <access_token>`.
+    Access tokens are EdDSA-signed JWTs that live 15 minutes. Refresh tokens are
+    opaque, single-use and rotated on every refresh. Presenting an already-used
+    refresh token revokes the whole session.
+
+    **Envelope.** Every response uses the same shape:
+    `{"success": true, "message": "...", "data": {...}, "request_id": "..."}`, or
+    `{"success": false, "error": {"code": "...", "message": "...", "details": [...]}, "request_id": "..."}`.
+    Clients should branch on `error.code`, not on `message`.
+
+    **Rate limits.** `429` responses carry `Retry-After`. Limits: 120 req/min per IP
+    overall, 10 req/min per IP per credential endpoint, 30 req/min per IP for
+    refresh/logout, 10 per 15 min per user for password-checking endpoints, and a
+    15-minute lockout per account after 5 failed logins.
+
+    **Mock email.** Codes and reset tokens are delivered only by email (Mailpit at
+    http://localhost:8025 with Docker, or `tmp/outbox/*.eml` locally). They never
+    appear in responses or logs.
+servers:
+  - url: http://localhost:8080
+    description: Local gateway
+tags:
+  - name: Registration
+  - name: Authentication
+  - name: Password
+  - name: Profile
+paths:
+  /api/v1/auth/register:
+    post:
+      tags: [Registration]
+      summary: Register a new user
+      description: Creates an unverified account and emails a 6-digit code (valid 5 minutes).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example: { name: Jane Doe, email: jane@example.com, password: Str0ng-pass }
+      responses:
+        '201':
+          description: Account created, code sent
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Success'
+                  - properties: { data: { $ref: '#/components/schemas/RegisteredUser' } }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
+        '415': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/verify-otp:
+    post:
+      tags: [Registration]
+      summary: Verify registration OTP
+      description: |
+        Activates the account. Each code is single-use and allows 5 attempts.
+        Unknown emails and already-verified accounts get the same `INVALID_OTP`
+        error as a wrong code.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VerifyOTPRequest' }
+            example: { email: jane@example.com, otp: '123456' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400':
+          description: '`INVALID_OTP`, `OTP_EXPIRED`, `OTP_ATTEMPTS_EXCEEDED` or `VALIDATION_ERROR`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/resend-otp:
+    post:
+      tags: [Registration]
+      summary: Resend registration OTP
+      description: |
+        Invalidates the previous code and sends a new one. There is a 60-second
+        cooldown (`OTP_RESEND_COOLDOWN`) and a cap of 5 codes per hour
+        (`OTP_RESEND_LIMIT`). Unknown or already-verified emails get the same 200.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Authenticate a user
+      description: |
+        Wrong password and unknown email both return `401 INVALID_CREDENTIALS`.
+        `EMAIL_NOT_VERIFIED` and `ACCOUNT_DEACTIVATED` (403) are only returned
+        when the password is correct.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example: { email: jane@example.com, password: Str0ng-pass }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Refresh the access token
+      description: |
+        Returns a new access token and a new refresh token; the presented one is
+        consumed. Reusing a consumed token returns `REFRESH_TOKEN_REUSED` and
+        revokes the session.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Tokens' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401':
+          description: '`INVALID_REFRESH_TOKEN` or `REFRESH_TOKEN_REUSED`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '403': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Revoke the refresh token's session
+      description: |
+        Revokes the session. Its refresh token and access tokens stop working
+        immediately. Idempotent: unknown tokens also return 200.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [Password]
+      summary: Request a password reset
+      description: |
+        Always returns the same 200, whether or not the account exists. If it
+        does, a single-use reset token (valid 15 minutes) is emailed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/reset-password:
+    post:
+      tags: [Password]
+      summary: Reset the password with a reset token
+      description: |
+        Sets the new password and revokes all sessions, other reset tokens and
+        codes. Also verifies a still-pending account, since the reset proves
+        ownership of the email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResetPasswordRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400':
+          description: '`INVALID_RESET_TOKEN` or `VALIDATION_ERROR`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/auth/change-password:
+    post:
+      tags: [Password]
+      summary: Change password (authenticated)
+      description: Requires the current password. Signs out all other sessions.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePasswordRequest' }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400':
+          description: '`INVALID_CURRENT_PASSWORD` or `VALIDATION_ERROR`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/users/me:
+    get:
+      tags: [Profile]
+      summary: Retrieve own profile
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { $ref: '#/components/responses/Profile' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Profile]
+      summary: Update own profile
+      description: |
+        Only `name` and `phone_number` are writable. Any other field, including
+        `email`, `status`, `email_verified` and `id`, is rejected with
+        `VALIDATION_ERROR`. Omit a field to leave it unchanged; send
+        `phone_number: ""` to clear it.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateProfileRequest' }
+            example: { name: Jane Q. Doe, phone_number: '+6281234567890' }
+      responses:
+        '200': { $ref: '#/components/responses/Profile' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /api/v1/users/me/change-email:
+    post:
+      tags: [Profile]
+      summary: Request an email change
+      description: |
+        Requires the current password and sends a code to the new address. The
+        email only changes after `/change-email/verify`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangeEmailRequest' }
+      responses:
+        '202':
+          description: Code sent to the new address
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Success'
+                  - properties:
+                      data:
+                        type: object
+                        properties: { code_expires_at: { type: string, format: date-time } }
+        '400':
+          description: '`INVALID_CURRENT_PASSWORD` or `VALIDATION_ERROR`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /api/v1/users/me/change-email/verify:
+    post:
+      tags: [Profile]
+      summary: Confirm an email change
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [otp]
+              additionalProperties: false
+              properties: { otp: { type: string, pattern: '^[0-9]{6}$' } }
+      responses:
+        '200': { $ref: '#/components/responses/Profile' }
+        '400':
+          description: '`INVALID_OTP`, `OTP_EXPIRED`, `OTP_ATTEMPTS_EXCEEDED`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/EmailTaken' }
+  /api/v1/users/me/deactivate:
+    post:
+      tags: [Profile]
+      summary: Deactivate own account
+      description: |
+        Requires the current password. Every session is revoked immediately, so
+        existing access and refresh tokens stop working on their next use.
+        Logging in afterwards returns `403 ACCOUNT_DEACTIVATED`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password]
+              additionalProperties: false
+              properties: { current_password: { type: string } }
+      responses:
+        '200': { $ref: '#/components/responses/Message' }
+        '400': { $ref: '#/components/responses/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT (EdDSA)
+  schemas:
+    Success:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        message: { type: string }
+        request_id: { type: string }
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+        request_id: { type: string }
+    RegisterRequest:
+      type: object
+      required: [name, email, password]
+      additionalProperties: false
+      properties:
+        name: { type: string, maxLength: 100 }
+        email: { type: string, format: email, maxLength: 254 }
+        password:
+          type: string
+          minLength: 8
+          maxLength: 128
+          description: At least one letter and one digit; not a common password; not equal to the email.
+    VerifyOTPRequest:
+      type: object
+      required: [email, otp]
+      additionalProperties: false
+      properties:
+        email: { type: string, format: email }
+        otp: { type: string, pattern: '^[0-9]{6}$' }
+    EmailRequest:
+      type: object
+      required: [email]
+      additionalProperties: false
+      properties:
+        email: { type: string, format: email }
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token: { type: string }
+    ResetPasswordRequest:
+      type: object
+      required: [token, new_password]
+      additionalProperties: false
+      properties:
+        token: { type: string }
+        new_password: { type: string, minLength: 8, maxLength: 128 }
+    ChangePasswordRequest:
+      type: object
+      required: [current_password, new_password]
+      additionalProperties: false
+      properties:
+        current_password: { type: string }
+        new_password: { type: string, minLength: 8, maxLength: 128 }
+    UpdateProfileRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: { type: string, maxLength: 100 }
+        phone_number: { type: string, description: 'E.164, e.g. +6281234567890; "" clears it' }
+    ChangeEmailRequest:
+      type: object
+      required: [new_email, current_password]
+      additionalProperties: false
+      properties:
+        new_email: { type: string, format: email }
+        current_password: { type: string }
+    RegisteredUser:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        status: { type: string, enum: [pending_verification, active, deactivated] }
+        email_verified: { type: boolean }
+        created_at: { type: string, format: date-time }
+    Profile:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        phone_number: { type: string, nullable: true }
+        status: { type: string, enum: [active] }
+        email_verified: { type: boolean }
+        email_verified_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, example: Bearer }
+        expires_in: { type: integer, example: 900 }
+        refresh_token: { type: string }
+        refresh_expires_in: { type: integer, example: 604800 }
+  responses:
+    Message:
+      description: Success with a message only
+      content: { application/json: { schema: { $ref: '#/components/schemas/Success' } } }
+    Tokens:
+      description: New token pair
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Success'
+              - properties: { data: { $ref: '#/components/schemas/TokenPair' } }
+    Profile:
+      description: The caller's profile
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/Success'
+              - properties: { data: { $ref: '#/components/schemas/Profile' } }
+    Error:
+      description: Error (see error.code)
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    ValidationError:
+      description: '`VALIDATION_ERROR` (with per-field details) or `INVALID_JSON`'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    EmailTaken:
+      description: '`EMAIL_ALREADY_REGISTERED`'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    Unauthorized:
+      description: '`MISSING_TOKEN`, `INVALID_TOKEN`, `TOKEN_EXPIRED` or `SESSION_REVOKED`'
+      headers:
+        WWW-Authenticate: { schema: { type: string } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds to wait }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }

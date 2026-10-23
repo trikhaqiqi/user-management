@@ -1,0 +1,173 @@
+# Full stack: Postgres, Redis, Mailpit (mock mail inbox), migrations and the
+# three services. Only the gateway (8080) and Mailpit's UI (8025) are exposed;
+# auth-service and core-service are reachable only on the compose network.
+#
+# Monitoring (profile "monitoring"): Loki stores logs, Alloy collects them and
+# Grafana shows them (http://localhost:3030).
+#
+#   make env                                   # once: .env with generated secrets
+#   docker compose up -d --build               # app stack
+#   docker compose --profile monitoring up -d  # app stack + monitoring
+#   make monitoring-up                         # monitoring only (for `make run`)
+name: godigi
+
+x-service-env: &service-env
+  DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-user_management}?sslmode=disable
+  REDIS_URL: redis://redis:6379/0
+  MAIL_DRIVER: smtp
+  SMTP_ADDR: mailpit:1025
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-user_management}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - "8025:8025"   # inbox UI + API
+      - "1025:1025"   # SMTP
+
+  migrate:
+    image: migrate/migrate:v4.18.1
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-user_management}?sslmode=disable"
+      - "up"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    labels:
+      godigi.logs: "true"   # picked up by Alloy
+    env_file: .env
+    environment:
+      <<: *service-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  core-service:
+    build:
+      context: .
+      dockerfile: core-service/Dockerfile
+    labels:
+      godigi.logs: "true"   # picked up by Alloy
+    env_file: .env
+    environment:
+      <<: *service-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_started
+    restart: unless-stopped
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    labels:
+      godigi.logs: "true"   # picked up by Alloy
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      AUTH_SERVICE_URL: http://auth-service:8091
+      CORE_SERVICE_URL: http://core-service:8092
+      OPENAPI_SPEC_PATH: /docs/openapi.yaml
+    ports:
+      - "${GATEWAY_HOST_PORT:-8080}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      auth-service:
+        condition: service_started
+      core-service:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---- Monitoring ------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.5.3
+    profiles: [monitoring]
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./monitoring/loki/loki-config.yaml:/etc/loki/config.yaml:ro
+      - lokidata:/loki
+    ports:
+      - "127.0.0.1:${LOKI_HOST_PORT:-3101}:3100"
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.10.0
+    profiles: [monitoring]
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro   # container logs
+      - ./tmp/logs:/var/log/godigi:ro                  # logs of `make run`
+      - alloydata:/var/lib/alloy/data                  # read positions survive restarts
+    ports:
+      - "127.0.0.1:${ALLOY_HOST_PORT:-12345}:12345"    # Alloy's own debug UI
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:12.1.0
+    profiles: [monitoring]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/godigi-http.json
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "${GRAFANA_HOST_PORT:-3030}:3000"
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  lokidata:
+  alloydata:
+  grafanadata:
