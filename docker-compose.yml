@@ -14,7 +14,7 @@ name: godigi
 x-service-env: &service-env
   DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-user_management}?sslmode=disable
   REDIS_URL: redis://redis:6379/0
-  MAIL_DRIVER: smtp
+  MAIL_DRIVER: ${COMPOSE_MAIL_DRIVER:-smtp}   # smtp = Mailpit; resend = real delivery
   SMTP_ADDR: mailpit:1025
 
 services:

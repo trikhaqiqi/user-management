@@ -31,6 +31,14 @@ PASSWORD = "S3cure-pass-" + RUN
 
 passed, failed = 0, 0
 
+# The scenarios read codes back from Mailpit or the file outbox, and register
+# dozens of @example.com addresses. Against a real provider that would fail and
+# burn sending quota, so refuse to run.
+_driver_file = os.path.join(os.path.dirname(__file__), "..", "tmp", "run", "mail_driver")
+if not MAILPIT and os.path.exists(_driver_file) and open(_driver_file).read().strip() == "resend":
+    sys.exit("e2e needs the file mail driver (or Mailpit via MAILPIT_URL), but the services run with MAIL_DRIVER=resend.\n"
+             "Run: MAIL_DRIVER=file make restart && make e2e")
+
 
 def call(method, path, body=None, token=None, headers=None, base=BASE, raw=None):
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)

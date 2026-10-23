@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"godigi/pkg/config"
 	"godigi/pkg/logger"
 )
@@ -29,16 +31,28 @@ type Message struct {
 	To      string
 	Subject string
 	Body    string
+	// id identifies one logical email across retries (see Resend's
+	// Idempotency-Key). Assigned on Enqueue.
+	id string
+}
+
+func (m Message) idempotencyKey() string {
+	if m.id == "" {
+		return uuid.NewString()
+	}
+	return m.id
 }
 
 type Sender interface {
 	Send(ctx context.Context, m Message) error
 }
 
-// FromEnv builds the configured sender: MAIL_DRIVER=smtp|file.
+// FromEnv builds the configured sender: MAIL_DRIVER=resend|smtp|file.
 func FromEnv(l *config.Loader) Sender {
 	from := l.String("MAIL_FROM", "Godigi <no-reply@godigi.local>")
 	switch driver := l.String("MAIL_DRIVER", "smtp"); driver {
+	case "resend":
+		return NewResendSender(l.Secret("RESEND_API_KEY", 10), from)
 	case "file":
 		return &FileSender{Dir: l.String("MAIL_OUTBOX_DIR", "./tmp/outbox"), From: from}
 	default:
@@ -138,6 +152,7 @@ func (a *Async) Enqueue(m Message) {
 		a.log.Error("mail dropped: mailer closed", "to", logger.MaskEmail(m.To), "subject", m.Subject)
 		return
 	}
+	m.id = uuid.NewString()
 	select {
 	case a.queue <- m:
 	default:
@@ -155,6 +170,9 @@ func (a *Async) work() {
 			cancel()
 			if err == nil {
 				a.log.Info("mail sent", "to", logger.MaskEmail(m.To), "subject", m.Subject)
+				break
+			}
+			if isPermanent(err) {
 				break
 			}
 			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)

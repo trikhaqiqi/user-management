@@ -12,7 +12,12 @@ mkdir -p "$RUN_DIR" "$LOG_DIR"
 [[ -f .env ]] || { echo ".env missing; run: make env" >&2; exit 1; }
 
 start() {
+  # Variables already set in the environment win over .env, so e.g.
+  # `MAIL_DRIVER=file make run` works.
+  local overrides; overrides=$(export -p)
   set -a; source "$ROOT/.env"; set +a
+  eval "$overrides"
+  echo "${MAIL_DRIVER:-smtp}" >"$RUN_DIR/mail_driver"
   for svc in "${SERVICES[@]}"; do
     if [[ -f "$RUN_DIR/$svc.pid" ]] && kill -0 "$(cat "$RUN_DIR/$svc.pid")" 2>/dev/null; then
       echo "$svc already running"; continue

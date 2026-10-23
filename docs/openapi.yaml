@@ -20,8 +20,8 @@ info:
     refresh/logout, 10 per 15 min per user for password-checking endpoints, and a
     15-minute lockout per account after 5 failed logins.
 
-    **Mock email.** Codes and reset tokens are delivered only by email (Mailpit at
-    http://localhost:8025 with Docker, or `tmp/outbox/*.eml` locally). They never
+    **Email.** Codes and reset tokens are delivered only by email (Resend, or in
+    development Mailpit at http://localhost:8025 / `tmp/outbox/*.eml`). They never
     appear in responses or logs.
 servers:
   - url: http://localhost:8080

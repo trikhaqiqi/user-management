@@ -23,7 +23,7 @@ PostgreSQL and Redis, with request/response monitoring in Grafana.
                   └───┬────────┬───┘          └───────┬────────┘
                       │        │ Redis (rate limits)  │
                       ▼        ▼                      ▼
-                  PostgreSQL ◀────────────────────────┘      Mail (Mailpit / file outbox)
+                  PostgreSQL ◀────────────────────────┘      Mail (Resend / Mailpit / file outbox)
 
  JSON logs (stdout / tmp/logs) ──▶ Alloy ──▶ Loki ──▶ Grafana :3030
 ```
@@ -93,8 +93,36 @@ make monitoring-up       # optional: Grafana at http://localhost:3030 (needs Doc
 make stop
 ```
 
-With `MAIL_DRIVER=file` (the default in `.env.example`), outgoing mail is
-written to `tmp/outbox/*.eml`. Read OTPs and reset tokens from there.
+Email is delivered through **Resend** (`MAIL_DRIVER=resend`, the default in
+`.env.example`). Put your API key in `RESEND_API_KEY`; see
+[Email delivery](#email-delivery) for the sender-domain restriction. To work
+without sending real mail, use `MAIL_DRIVER=file`. Mail is then written to
+`tmp/outbox/*.eml`, where you can read OTPs and reset tokens.
+
+### Email delivery
+
+| `MAIL_DRIVER` | Delivery | Use for |
+|---|---|---|
+| `resend` | Real email through the [Resend API](https://resend.com/docs/api-reference/emails/send-email) | Demo / production |
+| `smtp` | Any SMTP server; Mailpit in docker compose (inbox at http://localhost:8025) | Docker dev |
+| `file` | `.eml` files in `MAIL_OUTBOX_DIR` | Local dev, `make e2e` |
+
+**Resend without a verified domain.** Until a domain is verified in the
+Resend dashboard, `MAIL_FROM` must be `onboarding@resend.dev`, and Resend
+only delivers to **the email address of the Resend account owner**. Any other
+recipient is rejected with `422`/`403 validation_error`, which shows up in
+auth-service's log as `mail delivery failed`. To send to anyone, verify a
+domain at https://resend.com/domains and set
+`MAIL_FROM="Godigi <no-reply@yourdomain.com>"`. Resend's test address
+`delivered@resend.dev` accepts mail without delivering it, which is handy for
+checking that the integration works.
+
+Sending is asynchronous (a small worker pool) so API latency and timing do
+not depend on the provider. Transient failures (`429`, `5xx`, network) are
+retried up to 3 times with the same `Idempotency-Key`, so a retry never
+delivers a code twice. Permanent rejections (`4xx`) are logged once and not
+retried. The log line carries a masked recipient and the subject, never the
+code.
 
 ### Option B: Docker Compose
 
@@ -103,7 +131,8 @@ make env                 # set POSTGRES_PASSWORD in .env
 docker compose up -d --build
 ```
 
-Compose starts Postgres, Redis, **Mailpit** (inbox UI at http://localhost:8025),
+Compose starts Postgres, Redis, **Mailpit** (inbox UI at http://localhost:8025;
+compose services send there unless `COMPOSE_MAIL_DRIVER=resend`),
 runs the migrations once, then starts the services. Only the gateway (`:8080`)
 and Mailpit are published. auth-service and core-service are reachable only
 inside the compose network. Add `--profile monitoring` to also start Loki,
@@ -127,7 +156,7 @@ Redis 6380. Every host port can be overridden in `.env` (`GATEWAY_HOST_PORT`,
 | Command | Covers |
 |---|---|
 | `make test` | Unit tests: argon2id hashing, password policy, OTP HMAC binding, JWT (rejects `alg=none`, HS256 algorithm confusion, foreign keys, wrong issuer/type, expiry), strict JSON binding, gateway header trust boundary, access-log redaction. |
-| `make e2e` | 85 checks over the real stack, including concurrency (5 parallel OTP verifications and 5 parallel refreshes each succeed exactly once), reuse detection, every revocation path, rate limits, protected fields, and a final scan proving no emailed OTP/reset token, JWT or password reached the logs. Against Docker: `BASE_URL=http://localhost:8080 MAILPIT_URL=http://localhost:8025 REDIS_CLI="redis-cli -p 6380" make e2e`. |
+| `make e2e` | Needs `MAIL_DRIVER=file` or Mailpit, because it reads codes back from the outbox; it refuses to run against `resend`. Run `MAIL_DRIVER=file make restart && make e2e`. 85 checks over the real stack, including concurrency (5 parallel OTP verifications and 5 parallel refreshes each succeed exactly once), reuse detection, every revocation path, rate limits, protected fields, and a final scan proving no emailed OTP/reset token, JWT or password reached the logs. Against Docker: `BASE_URL=http://localhost:8080 MAILPIT_URL=http://localhost:8025 REDIS_CLI="redis-cli -p 6380" make e2e`. |
 
 ---
 
@@ -151,7 +180,10 @@ service refuses to start and lists every missing or invalid value.
 | `LOGIN_MAX_FAILURES` / `LOGIN_LOCKOUT` | auth | `5` failures → `15m` lockout per account |
 | `RATE_LIMIT_*` | gateway | Per-IP and per-user request budgets |
 | `TRUSTED_PROXIES` | gateway | CIDRs allowed to set `X-Forwarded-For` (empty = trust none) |
-| `MAIL_DRIVER` | auth, core | `smtp` (Mailpit) or `file` (`MAIL_OUTBOX_DIR`) |
+| `MAIL_DRIVER` | auth, core | `resend`, `smtp` (Mailpit) or `file` (`MAIL_OUTBOX_DIR`) |
+| `RESEND_API_KEY` | auth, core | Resend API key (required when `MAIL_DRIVER=resend`) |
+| `MAIL_FROM` | auth, core | Sender; must be `onboarding@resend.dev` until a Resend domain is verified |
+| `COMPOSE_MAIL_DRIVER` | compose | Mail driver inside docker compose (default `smtp` → Mailpit) |
 | `LOG_HTTP_BODIES` | gateway | Log redacted request/response bodies (default `false`; `true` in `.env.example`) |
 | `GRAFANA_ADMIN_PASSWORD` | compose | Grafana `admin` password (generated by `make env`) |
 | `GRAFANA_HOST_PORT` / `LOKI_HOST_PORT` | compose | `3030` / `3101` |
@@ -516,8 +548,9 @@ Example queries for Explore:
   so the address cannot be re-registered.
 - Unverified accounts are never purged; a cleanup job would free squatted
   addresses. A password reset already lets the real owner reclaim one.
-- Email is a mock (Mailpit/file). Production would need a real provider and an
-  outbox table, so mail survives a crash between commit and send.
+- Mail is queued in memory after the transaction commits, so a crash in
+  between loses that one email. The user can resend the OTP or request
+  another reset. A transactional outbox table would close the gap.
 - The access-token signing key has no rotation (`kid`, JWKS). Today, rotating
   it means redeploying the gateway with the new public key.
 - TLS is expected to be terminated in front of the gateway. Set
